@@ -28,6 +28,8 @@ from mrcnn import utils
 
 from distutils.version import LooseVersion
 
+tf.compat.v1.disable_eager_execution()
+
 # Requires TensorFlown 2.0+
 assert LooseVersion(tf.__version__) >= LooseVersion('2.0')
 
@@ -550,12 +552,15 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     # Positive ROIs
     positive_count = int(config.TRAIN_ROIS_PER_IMAGE *
                          config.ROI_POSITIVE_RATIO)
-    positive_indices = tf.random_shuffle(positive_indices)[:positive_count]
+    # tf.random_shuffle has been moved to tf.random.shuffle
+    #positive_indices = tf.random_shuffle(positive_indices)[:positive_count]
+    positive_indices = tf.random.shuffle(positive_indices)[:positive_count]
     positive_count = tf.shape(positive_indices)[0]
     # Negative ROIs. Add enough to maintain positive:negative ratio.
     r = 1.0 / config.ROI_POSITIVE_RATIO
     negative_count = tf.cast(r * tf.cast(positive_count, tf.float32), tf.int32) - positive_count
-    negative_indices = tf.random_shuffle(negative_indices)[:negative_count]
+    #negative_indices = tf.random_shuffle(negative_indices)[:negative_count]
+    negative_indices = tf.random.shuffle(negative_indices)[:negative_count]
     # Gather selected ROIs
     positive_rois = tf.gather(proposals, positive_indices)
     negative_rois = tf.gather(proposals, negative_indices)
@@ -1956,7 +1961,19 @@ class MaskRCNN():
             # TODO: can this be optimized to avoid duplicating the anchors?
             anchors = np.broadcast_to(anchors, (config.BATCH_SIZE,) + anchors.shape)
             # A hack to get around Keras's bad support for constants
-            anchors = KL.Lambda(lambda x: tf.Variable(anchors), name="anchors")(input_image)
+            # The line below gives an error with tensorlow 2.3 
+            # anchors = KL.Lambda(lambda x: tf.Variable(anchors), name="anchors")(input_image)
+            # Using the solution discussed and presented in: https://github.com/matterport/Mask_RCNN/issues/1930
+            class AnchorsLayer(KL.Layer):
+                def __init__(self, anchors, name="anchors", **kwargs):
+                    super(AnchorsLayer, self).__init__(name=name, **kwargs)
+                    self.anchors = tf.Variable(anchors)
+                def call(self, dummy):
+                    return self.anchors
+                def get_config(self):
+                    config = super(AnchorsLayer, self).get_config()
+                    return config
+            anchors = AnchorsLayer(anchors, name="anchors")(input_image)
         else:
             anchors = input_anchors
 
@@ -2193,8 +2210,9 @@ class MaskRCNN():
             clipnorm=self.config.GRADIENT_CLIP_NORM)
         # Add Losses
         # First, clear previously set losses to avoid duplication
-        self.keras_model._losses = []
-        self.keras_model._per_input_losses = {}
+        # TODO: Confirm that commenting the following lines does not break the loss calculation
+        #self.keras_model._losses = []
+        #self.keras_model._per_input_losses = {}
         loss_names = [
             "rpn_class_loss",  "rpn_bbox_loss",
             "mrcnn_class_loss", "mrcnn_bbox_loss", "mrcnn_mask_loss"]
@@ -2203,8 +2221,8 @@ class MaskRCNN():
             if layer.output in self.keras_model.losses:
                 continue
             loss = (
-                tf.reduce_mean(layer.output, keepdims=True)
-                * self.config.LOSS_WEIGHTS.get(name, 1.))
+                    tf.reduce_mean(layer.output, keepdims=True) 
+            * self.config.LOSS_WEIGHTS.get(name, 1.))
             self.keras_model.add_loss(loss)
 
         # Add L2 Regularization
@@ -2229,7 +2247,10 @@ class MaskRCNN():
             loss = (
                 tf.reduce_mean(layer.output, keepdims=True)
                 * self.config.LOSS_WEIGHTS.get(name, 1.))
-            self.keras_model.metrics_tensors.append(loss)
+            #self.keras_model.metrics_tensors.append(loss)
+            # TODO: Double check
+            # tf.keras does not have metrics_tensors
+            self.keras_model.add_metric(loss, name=name, aggregation='mean')
 
     def set_trainable(self, layer_regex, keras_model=None, indent=0, verbose=1):
         """Sets model layers as trainable if their names match
@@ -2392,9 +2413,12 @@ class MaskRCNN():
         if os.name is 'nt':
             workers = 0
         else:
-            workers = multiprocessing.cpu_count()
-
-        self.keras_model.fit_generator(
+            # In newer tensorflow multiprocessing causes deadlock
+            # workers = multiprocessing.cpu_count()
+            workers = 1
+        # In the newer tf/keras versions it is recommended to use fit as fit_generator is deprecated and will be removed
+        #self.keras_model.fit_generator(
+        self.keras_model.fit(
             train_generator,
             initial_epoch=self.epoch,
             epochs=epochs,
@@ -2404,7 +2428,8 @@ class MaskRCNN():
             validation_steps=self.config.VALIDATION_STEPS,
             max_queue_size=100,
             workers=workers,
-            use_multiprocessing=True,
+            use_multiprocessing=False,
+            verbose=1
         )
         self.epoch = max(self.epoch, epochs)
 
